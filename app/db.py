@@ -92,6 +92,17 @@ CREATE TABLE IF NOT EXISTS requisition_orders (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_request_id
     ON requisition_orders(request_id) WHERE request_id IS NOT NULL;
 
+-- 请求号归属表：请求号全局唯一，一张领料单可被多个请求号认领。
+-- requisition_orders.request_id 只保留“建单时自带的原始请求号”（回执快照亦然），
+-- 后续重发/换号重发认领的号码只写这里，不改旧单与原回执。
+CREATE TABLE IF NOT EXISTS order_request_ids (
+    request_id  TEXT PRIMARY KEY,
+    order_id    INTEGER NOT NULL REFERENCES requisition_orders(id) ON DELETE CASCADE,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_order_request_ids_order
+    ON order_request_ids(order_id);
+
 CREATE TABLE IF NOT EXISTS requisition_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id    INTEGER NOT NULL REFERENCES requisition_orders(id) ON DELETE CASCADE,
@@ -150,8 +161,25 @@ def init_db() -> None:
         except sqlite3.DatabaseError:
             pass
         conn.executescript(SCHEMA)
+        _backfill_request_id_claims(conn)
     finally:
         conn.close()
+
+
+def _backfill_request_id_claims(conn: sqlite3.Connection) -> None:
+    """旧库升级：把历史领料单自带的原始 request_id 补登记到归属表。
+
+    旧版本只把 request_id 存在 requisition_orders 上，没有归属表；
+    升级后这些号码同样“归原单”，因此幂等重发与同号冲突语义保持一致。
+    """
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO order_request_ids (request_id, order_id, created_at)
+        SELECT request_id, id, created_at
+          FROM requisition_orders
+         WHERE request_id IS NOT NULL
+        """
+    )
 
 
 def get_db() -> Iterator[sqlite3.Connection]:

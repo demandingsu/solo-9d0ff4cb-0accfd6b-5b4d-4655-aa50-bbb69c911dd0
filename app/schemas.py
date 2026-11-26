@@ -164,9 +164,21 @@ class ConfirmPickIn(BaseModel):
 class ConfirmRequest(BaseModel):
     book_id: int
     request_id: str | None = Field(
-        None, max_length=120, description="可选客户端幂等号；同号同单重发返回原领料单"
+        None,
+        max_length=120,
+        description="可选客户端请求号；成功后该号归属本单，同号同单重发返回原领料单，"
+        "同号用于其他方案返回 409",
     )
     pick_lists: list[ConfirmPickIn] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _normalize_request_id(self) -> "ConfirmRequest":
+        # 需求只对“非空 request_id”赋予归属语义；空串/全空白视同未带号，
+        # 避免与“部分唯一索引把空串当成一个真实号”的歧义。
+        if self.request_id is not None:
+            stripped = self.request_id.strip()
+            self.request_id = stripped or None
+        return self
 
     @model_validator(mode="after")
     def _samples_unique(self) -> "ConfirmRequest":
@@ -231,7 +243,13 @@ class OrderDetail(BaseModel):
     id: int
     order_no: str
     book_id: int
-    request_id: str | None
+    request_id: str | None = Field(
+        ..., description="建单时自带的原始请求号（旧单重发/换号认领不会改写此字段）"
+    )
+    request_ids: list[str] = Field(
+        default_factory=list,
+        description="归本单的全部请求号：原始号 + 后续同方案重发/换号认领的号",
+    )
     fingerprint: str
     status: str
     created_at: str

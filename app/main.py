@@ -399,7 +399,7 @@ def confirm_plan(
                 (plan["confirmed_order_id"],),
             ).fetchone()
             if order is not None:
-                return services._replay_envelope(order, "plan_already_confirmed")  # noqa: SLF001
+                return services._replay_envelope(c, order, "plan_already_confirmed")  # noqa: SLF001
 
         req_data = json.loads(plan["request_json"])
         if not req_data.get("pick_lists"):
@@ -471,7 +471,18 @@ def list_requisitions(
             "total_pieces, created_at FROM requisition_orders WHERE book_id = ? ORDER BY id",
             (book_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    if not items:
+        return items
+    # 归属号（原始号 + 换号认领的号）一并列出，便于核对幂等归属。
+    claims: dict[int, list[str]] = {}
+    for r in conn.execute(
+        "SELECT order_id, request_id FROM order_request_ids ORDER BY created_at, request_id"
+    ):
+        claims.setdefault(int(r["order_id"]), []).append(r["request_id"])
+    for item in items:
+        item["request_ids"] = claims.get(int(item["id"]), [])
+    return items
 
 
 @app.get("/api/requisitions/{order_ref}", tags=["领料确认"], summary="领料单详情（按 ID 或 LL-0001 单号）")
@@ -491,7 +502,10 @@ def get_requisition(
         raise HTTPException(
             404, detail={"code": "requisition_not_found", "order_ref": order_ref}
         )
-    return json.loads(row["response_json"])
+    # 回执字段保持建单快照；仅 request_ids 反映当前归属（换号认领后的集合）。
+    detail = json.loads(row["response_json"])
+    detail["request_ids"] = services._request_ids_for_order(conn, int(row["id"]))  # noqa: SLF001
+    return detail
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +530,7 @@ def admin_reset(conn: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
         for table in (
             "stock_movements",
             "requisition_items",
+            "order_request_ids",
             "requisition_orders",
             "trial_plans",
             "piles",

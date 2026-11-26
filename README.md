@@ -7,6 +7,11 @@
 - 试配只读取**同一时点**的余量与领料状态，**不占纸**，也不影响其他单确认；
 - 确认时在一个 `BEGIN IMMEDIATE` 事务内检查“纸够 + 单上样书都没领过料”，通过则**整单扣料**并把样书标记为已领料；冲突 **409 整单退回**，余量与领料状态照旧；
 - 已确认方案重发（同 `request_id` 或同方案指纹）**返回原领料单**，不二次扣料；
+- 带**非空 `request_id`** 的请求一旦领料成功（或同方案重发取回原单），该号就**归这份方案**：
+  同一张单可关联多个请求号；换新号重发仍拿原单，客户端的号被登记到原单上；
+- 同一个号再用于**其他方案** → `409 idempotency_key_conflict`，散帖余量、样书状态、扣料流水**保持原状**；
+- 请求失败（校验/余量/已领料冲突）时该号**不被占用**，可用于重试；
+- 归属关系落库（`order_request_ids` 表），服务**重启后同号同方案仍返回原单**；
 - 提供 Docker Compose 与 `/docs` 可交互演示，附纯标准库并发自测。
 
 ---
@@ -34,9 +39,12 @@ docker compose up --build
    - `confirm_request` 是可直接提交的确认请求体；`plan_id` 用于一键确认。
 3. `POST /api/plans/{plan_id}/confirm`：返回 `201` 和领料单 `LL-0001`，整单扣料、4 本样书变 `requisitioned`。
 4. **再点一次**该确认接口：返回 `200`、`replayed=true`、`replay_reason="plan_already_confirmed"`，仍是同一张 `LL-0001`，不重复扣料。
-5. 也可以把试配响应里的 `confirm_request` 原样 POST 到 `POST /api/requisitions`：同指纹返回原单（`replay_reason="same_plan"`）；带 `request_id` 时则按幂等号重放。
-6. 交错/争用冲突可观察：把一张含已领料样书或超过余量的单 POST 到 `/api/requisitions`，会得到 `409`，`detail.code` 为 `samples_already_requisitioned` 或 `insufficient_stock`，数据库无任何变化。
-7. `GET /api/requisitions`、`GET /api/requisitions/LL-0001`、`GET /api/books/{id}/piles`、`GET /api/piles/{pile_id}/movements` 可核对单据、余量与扣料流水。
+5. 也可以把试配响应里的 `confirm_request` 原样 POST 到 `POST /api/requisitions`：同指纹返回原单（`replay_reason="same_plan"`）。
+6. **换号重发**：把同一份 `confirm_request` 加上 `request_id: "DEMO-A"` 再 POST 到 `/api/requisitions`，仍返回原单 `LL-0001`，且响应 `order.request_ids` 里能看到 `DEMO-A`（旧单 `request_id` 字段与回执内容不变）。
+   - 再把 `request_id: "DEMO-A"` 用到**另一份方案**（例如另一本样书 + 同一垛）：返回 `409 idempotency_key_conflict`，`GET /api/books/{id}/piles`、样书状态与 `movements` 均无变化。
+   - 换一个**没用过的号**重试这份方案即可正常 `201`。
+7. 交错/争用冲突可观察：把一张含已领料样书或超过余量的单 POST 到 `/api/requisitions`，会得到 `409`，`detail.code` 为 `samples_already_requisitioned` 或 `insufficient_stock`，数据库无任何变化。
+8. `GET /api/requisitions`、`GET /api/requisitions/LL-0001`、`GET /api/books/{id}/piles`、`GET /api/piles/{pile_id}/movements` 可核对单据、请求号归属、余量与扣料流水。
 
 > Compose 中为演示/自测设置了 `ENABLE_RESET=1`，开放 `POST /api/admin/reset`。这是清库接口，**任何真实共享环境都应设为 `0`**。
 
@@ -53,6 +61,16 @@ BASE_URL=http://127.0.0.1:8000 python3 selftest.py
 ```
 
 清空演示卷：`docker compose down -v`。
+
+**重启复检**（验证“重启后同号同方案仍返回原单”）：先正常跑一遍自测，记下输出里的
+`SELFTEST_RESTART_STATE {...}`，在**同一 SQLite 文件**上重启 api 后执行：
+
+```bash
+python3 selftest.py --restart-check '<上面那行 JSON>'
+```
+
+Compose 下由于 api 容器无法在自测中途重启，这一步在宿主机/本地裸跑模式验证最方便；
+数据落在命名卷里，`docker compose restart api` 后同样保留归属关系（已用同一 DB 文件实测）。
 
 ---
 
@@ -84,8 +102,8 @@ BASE_URL=http://127.0.0.1:8000 python3 selftest.py
 | `POST /api/books/{id}/trial-matches` | **试配**：最大同时补齐数、逐本取帖单、诊断、方案指纹 |
 | `GET /api/plans/{plan_id}` | 回看试配方案 |
 | `POST /api/plans/{plan_id}/confirm` | 确认试配方案（幂等，重复调用返回原单） |
-| `POST /api/requisitions` | 直接提交领料单（可带 `request_id`，同方案指纹自动幂等） |
-| `GET /api/requisitions` / `GET /api/requisitions/{id或LL-0001}` | 领料单列表 / 详情（含逐本单与汇总扣料） |
+| `POST /api/requisitions` | 直接提交领料单（可带非空 `request_id`，同方案指纹自动幂等；成功后该号归属本单） |
+| `GET /api/requisitions` / `GET /api/requisitions/{id或LL-0001}` | 领料单列表 / 详情（含逐本单、汇总扣料与 `request_ids` 归属号） |
 | `GET /api/piles/{pile_id}/movements` | 某垛散帖的扣料流水与每单余额 |
 | `POST /api/demo/seed` | 造一份争用演示数据 |
 | `POST /api/admin/reset` | 清库（需 `ENABLE_RESET=1`） |
@@ -97,7 +115,7 @@ BASE_URL=http://127.0.0.1:8000 python3 selftest.py
 - `404 book_not_found / sample_not_found / pile_not_found / plan_not_found / requisition_not_found`
 - `409 samples_already_requisitioned`：单上有样书已领料，整单退回（明细给出样书与原单号）
 - `409 insufficient_stock`：余量不足（明细给出每垛 `required/remaining/short`）
-- `409 idempotency_key_conflict`：同一个 `request_id` 提交了不同方案
+- `409 idempotency_key_conflict`：同一个 `request_id` 用于了不同方案的领料单（该号已归属原单）
 - `422 invalid_pick_list`：取帖单不连续 / 不到末页 / 版号不符 / 同帖重复等
 - `422 empty_plan`：0 本入选的试配方案不能确认
 - `409 duplicate_sample_code / duplicate_pile_code`

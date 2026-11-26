@@ -345,6 +345,17 @@ def save_trial_plan(conn: sqlite3.Connection, result: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # 领料单序列化
 # --------------------------------------------------------------------------- #
+def _request_ids_for_order(conn: sqlite3.Connection, order_id: int) -> list[str]:
+    return [
+        r["request_id"]
+        for r in conn.execute(
+            "SELECT request_id FROM order_request_ids WHERE order_id = ?"
+            " ORDER BY created_at, request_id",
+            (order_id,),
+        )
+    ]
+
+
 def build_order_detail(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
     order = conn.execute(
         "SELECT * FROM requisition_orders WHERE id = ?", (order_id,)
@@ -423,6 +434,7 @@ def build_order_detail(conn: sqlite3.Connection, order_id: int) -> dict[str, Any
         "order_no": order["order_no"],
         "book_id": order["book_id"],
         "request_id": order["request_id"],
+        "request_ids": _request_ids_for_order(conn, int(order["id"])),
         "fingerprint": order["fingerprint"],
         "status": order["status"],
         "created_at": order["created_at"],
@@ -435,13 +447,83 @@ def build_order_detail(conn: sqlite3.Connection, order_id: int) -> dict[str, Any
 
 
 def _replay_envelope(
-    order_row: sqlite3.Row, reason: str
+    conn: sqlite3.Connection, order_row: sqlite3.Row, reason: str
 ) -> tuple[int, dict[str, Any]]:
+    """取回原单：回执字段沿用建单时的快照，只有 request_ids 反映当前归属。
+
+    旧单原有的 request_id 与回执内容保持原样；后续换号认领只体现在
+    request_ids（建单快照里没有该字段，这里补上当前归属集合）。
+    """
     snapshot = order_row["response_json"]
     order = json.loads(snapshot) if snapshot else None
     if order is None:
         raise RuntimeError(f"领料单 {order_row['id']} 缺少快照")
+    order["request_ids"] = _request_ids_for_order(conn, int(order_row["id"]))
     return 200, {"replayed": True, "replay_reason": reason, "order": order}
+
+
+def _claimed_order_row(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row | None:
+    """查 request_id 的归属单。
+
+    归属表 order_request_ids 是权威来源；同时兼容仅存在于
+    requisition_orders.request_id 的历史数据（启动时已回填，双保险）。
+    """
+    row = conn.execute(
+        """
+        SELECT o.*
+          FROM order_request_ids c
+          JOIN requisition_orders o ON o.id = c.order_id
+         WHERE c.request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        "SELECT * FROM requisition_orders WHERE request_id = ?", (request_id,)
+    ).fetchone()
+
+
+def _claim_request_id(
+    conn: sqlite3.Connection, request_id: str, order_id: int, now: str
+) -> None:
+    """把 request_id 登记到归属表（幂等：已归同一单则无操作）。
+
+    归属表 request_id 是主键，在 BEGIN IMMEDIATE 串行化下，
+    “先查后写”不会被其他确认事务穿插；主键约束是最后一道防线。
+    """
+    existing = conn.execute(
+        "SELECT order_id FROM order_request_ids WHERE request_id = ?", (request_id,)
+    ).fetchone()
+    if existing is not None:
+        if int(existing["order_id"]) != order_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_key_conflict",
+                    "message": "相同 request_id 已归属另一张领料单",
+                    "request_id": request_id,
+                    "existing_order_id": int(existing["order_id"]),
+                },
+            )
+        return
+    try:
+        conn.execute(
+            "INSERT INTO order_request_ids (request_id, order_id, created_at)"
+            " VALUES (?, ?, ?)",
+            (request_id, order_id, now),
+        )
+    except sqlite3.IntegrityError as exc:  # 极端情况下由主键兜底
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "idempotency_key_conflict",
+                "message": "相同 request_id 已被并发请求占用",
+                "request_id": request_id,
+            },
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -457,10 +539,9 @@ def create_order_in_tx(
 ) -> tuple[int, dict[str, Any]]:
     # 1) 幂等：request_id 优先；同指纹方案重发直接返回原单。
     if request_id:
-        row = conn.execute(
-            "SELECT * FROM requisition_orders WHERE request_id = ?", (request_id,)
-        ).fetchone()
+        row = _claimed_order_row(conn, request_id)
         if row is not None:
+            # 号码已归这张单：只允许同一方案取回原单。
             if row["fingerprint"] != fingerprint:
                 raise HTTPException(
                     status_code=409,
@@ -471,13 +552,17 @@ def create_order_in_tx(
                         "existing_order_no": row["order_no"],
                     },
                 )
-            return _replay_envelope(row, "request_id")
+            return _replay_envelope(conn, row, "request_id")
 
     fp_row = conn.execute(
         "SELECT * FROM requisition_orders WHERE fingerprint = ?", (fingerprint,)
     ).fetchone()
     if fp_row is not None:
-        return _replay_envelope(fp_row, "same_plan")
+        # 同方案重发：取回原单。带 request_id 时，该号在成功后即归此单
+        #（一张单可关联多个号；旧单自带的 request_id 与回执快照保持不变）。
+        if request_id:
+            _claim_request_id(conn, request_id, int(fp_row["id"]), utcnow_iso())
+        return _replay_envelope(conn, fp_row, "same_plan")
 
     # 2) 图书与样书存在性。
     book = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
@@ -673,6 +758,10 @@ def create_order_in_tx(
         "UPDATE requisition_orders SET order_no = ? WHERE id = ?",
         (order_no, order_id),
     )
+    # 创建成功即把本次自带的 request_id 登记为该单的归属号。
+    # （request_id 同时作为“原始请求号”留在 requisition_orders 与回执快照中。）
+    if request_id:
+        _claim_request_id(conn, request_id, order_id, now)
 
     for pick in picks:
         sid = int(pick["sample_id"])
